@@ -1,5 +1,33 @@
 # Changelog
 
+## v1.1.0 — 2026-06-09
+
+### Added
+
+- **option10 / option11** — Product-level options for the Portal Terms of Service URL and
+  Portal Privacy Policy URL. Both are PATCHed onto the new org immediately after `Create()`
+  succeeds (non-fatal — provisioning is not rolled back on PATCH failure).
+- **`$buttons` property** — `'Resend Welcome Email' => 'resendWelcome'` and
+  `'Resync Status' => 'resyncStatus'` buttons appear on the HostBill admin service page.
+- **`resendWelcome(): bool`** — Mints a fresh SSO token, validates the `https://` scheme,
+  and resends the welcome email via the HostBill `Emails` component (falls back to `@mail()`).
+- **`resyncStatus(): bool`** — Calls `orgSummary()` and surfaces zone/sub-client counts as an
+  admin info message.
+- **`ssoLogin(): void`** — Mints an SSO token and performs a `302` redirect to the validated
+  `https://` login URL. Called by HostBill when the client clicks the SSO link.
+- **`getUsage(): array`** — Returns `['disk' => active_zones, 'bandwidth' => sub_clients]`
+  for HostBill's usage graph. Non-fatal — returns zeros on API failure.
+- **`getServiceDetails(): string`** — Returns a minimal HTML table (Org ID, status, plan name,
+  zones, sub-clients, API calls, module version) for the HostBill admin service detail panel.
+  All values escaped with `htmlspecialchars()`.
+- **`clientArea(): string`** — Returns a self-contained HTML block with an SSO login button
+  and live usage summary (zones, sub-clients). Non-fatal if `orgSummary()` fails; shows just
+  the button. Suspended orgs receive a plain-text note.
+- **`driftSync(): array`** — Compares PanelDNS org statuses against a caller-supplied
+  `['org_id' => int, 'status' => string]` map and returns mismatched pairs. Intended for
+  HostBill Task Scheduler integration.
+- Version bumped to `1.1.0`.
+
 ## v1.0.0 — 2026-06-08
 
 Initial release.

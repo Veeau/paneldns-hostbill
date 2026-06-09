@@ -69,6 +69,8 @@ Copy the `includes/` folder into your HostBill installation root so that
 | **NS4 Hostname** | option7 | Vanity nameserver 4 (optional). |
 | **SOA Email** | option8 | SOA contact email for new zones. Optional — defaults to a sensible value if blank. |
 | **Termination Grace Period (Days)** | option9 | Days to wait before permanently deleting the org after a Terminate event. `0` = delete immediately (default). During the grace period the org is suspended. |
+| **Portal Terms of Service URL** | option10 | Optional URL for the reseller portal's Terms of Service page. If set, it is PATCHed onto the new org immediately after provisioning so sub-client invitations can link to it. |
+| **Portal Privacy Policy URL** | option11 | Optional URL for the reseller portal's Privacy Policy page. Same behaviour as option10. |
 
 4. Save the product.
 
@@ -93,11 +95,92 @@ After provisioning, the service detail page in HostBill admin shows:
 |---|---|
 | **PanelDNS Org ID** | The numeric ID of the reseller's org on the PanelDNS platform |
 
+## SSO (Single Sign-On)
+
+When the client clicks the SSO link in their HostBill portal, HostBill calls the module's
+`ssoLogin()` method. The module:
+
+1. Fetches a one-time login URL from `POST /platform/v1/orgs/{id}/sso-token`.
+2. Validates that the returned URL starts with `https://` (prevents redirect injection).
+3. Issues a `302 Location` redirect to the login URL.
+
+The SSO token is valid for 60 seconds. If the mint request fails, a plain-text error message
+is shown and the redirect does not happen.
+
+Admin staff can also trigger a resend of the welcome email (which includes a fresh SSO link)
+via the **Resend Welcome Email** button on the service page.
+
+## Admin Detail Panel
+
+When viewing a service in the HostBill admin area, the module renders a usage table via
+`getServiceDetails()`:
+
+| Field | Source |
+|---|---|
+| Org ID | `$this->details['option1']` |
+| Status | `orgSummary().org.status` — green for active, amber for suspended |
+| Plan | `orgSummary().plan.name` |
+| Zones used / limit | `orgSummary().usage.active_zones` / `plan.zones` |
+| Sub-clients used / limit | `orgSummary().usage.sub_clients` / `plan.clients` |
+| API calls this period | `orgSummary().usage.api_calls_current_period` |
+| Module version | Hardcoded from the class |
+
+Two admin action buttons are also shown:
+
+| Button | Method | Action |
+|---|---|---|
+| **Resend Welcome Email** | `resendWelcome()` | Mints a fresh SSO token and resends the welcome email |
+| **Resync Status** | `resyncStatus()` | Fetches live org summary and shows zone/sub-client counts |
+
+## Client Area
+
+HostBill calls `clientArea()` to render HTML in the client portal service view. The module
+returns a self-contained HTML block (no external template files) containing:
+
+- An **SSO login button** (`Login to PanelDNS`) that links to `?action=sso`.
+- A **usage summary** showing zones and sub-clients used vs. plan limits (non-fatal — falls
+  back to showing just the button if `orgSummary()` is unavailable).
+- A **suspension notice** if the org status is `suspended`.
+
+All server-supplied values are escaped with `htmlspecialchars()`.
+
+## Usage Graphs
+
+HostBill calls `getUsage()` to populate usage bar charts on the service detail page.
+The module maps PanelDNS usage fields to HostBill's expected keys:
+
+| HostBill key | PanelDNS field |
+|---|---|
+| `disk` | `usage.active_zones` |
+| `bandwidth` | `usage.sub_clients` |
+
+Returns `['disk' => 0, 'bandwidth' => 0]` on API failure (non-fatal).
+
+## Drift Sync
+
+`driftSync()` checks whether the PanelDNS org status is consistent with the local HostBill
+service status. It accepts an array of `['org_id' => int, 'status' => string]` pairs and
+returns:
+
+```php
+['checked' => int, 'mismatched' => [['org_id' => int, 'hb_status' => string, 'pdns_status' => string]]]
+```
+
+A mismatch is flagged when:
+- HostBill says **Active** but PanelDNS says **suspended**.
+- HostBill says **Suspended** but PanelDNS says **active**.
+
+Operators should wire this into **Settings → Task Scheduler** in HostBill to run nightly or
+hourly. Pass the service map via the `drift_sync_map` option key. The caller is responsible
+for acting on the returned mismatches (e.g. calling `Suspend()` / `Unsuspend()` for each).
+
 ## PanelDNS Platform API
 
 | Endpoint | Description |
 |---|---|
 | `POST /platform/v1/orgs` | Create a new reseller org |
+| `GET /platform/v1/orgs/{id}` | Get org details (nameservers, portal links) |
+| `PATCH /platform/v1/orgs/{id}` | Update org fields (portal ToS/Privacy URLs) |
 | `GET /platform/v1/orgs/{id}/summary` | Usage summary (zones, sub-clients, API calls) |
 | `POST /platform/v1/orgs/{id}/sso-token` | Mint a one-time SSO login URL |
 | `POST /platform/v1/orgs/{id}/suspend` | Suspend an org |

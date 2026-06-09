@@ -43,7 +43,7 @@ class paneldns extends HostingModule
     protected $description = 'PanelDNS — Reseller DNS Management Platform';
 
     /** Module version — bump in lockstep with the repo release tag. */
-    protected $version = '1.0.0';
+    protected $version = '1.1.0';
 
     /**
      * Server fields shown in Settings -> Apps when configuring the server.
@@ -141,6 +141,18 @@ class paneldns extends HostingModule
             'type'    => 'input',
             'default' => '0',
         ],
+        'option10' => [
+            'name'    => 'Portal Terms of Service URL',
+            'value'   => '',
+            'type'    => 'input',
+            'default' => '',
+        ],
+        'option11' => [
+            'name'    => 'Portal Privacy Policy URL',
+            'value'   => '',
+            'type'    => 'input',
+            'default' => '',
+        ],
     ];
 
     /**
@@ -155,6 +167,15 @@ class paneldns extends HostingModule
             'type'    => 'input',
             'default' => false,
         ],
+    ];
+
+    /**
+     * Custom admin buttons shown on the service detail page.
+     * HostBill calls the named method on this class when the button is clicked.
+     */
+    protected $buttons = [
+        'Resend Welcome Email' => 'resendWelcome',
+        'Resync Status'        => 'resyncStatus',
     ];
 
     // ── Internal state ────────────────────────────────────────────────────────
@@ -308,6 +329,19 @@ class paneldns extends HostingModule
 
         // Persist org ID in per-account details so all future hooks can find it.
         $this->details['option1']['value'] = (string) $newId;
+
+        // GDPR-LEGAL-01: if option10/11 (portal ToS/Privacy URLs) are set, PATCH them
+        // onto the new org so sub-client invitations can reference them immediately.
+        // Non-fatal — provisioning has already succeeded at this point.
+        $portalTermsUrl   = trim((string) ($this->options['option10']['value'] ?? ''));
+        $portalPrivacyUrl = trim((string) ($this->options['option11']['value'] ?? ''));
+        if ($portalTermsUrl || $portalPrivacyUrl) {
+            $patch = array_filter([
+                'portal_terms_url'   => $portalTermsUrl   ?: null,
+                'portal_privacy_url' => $portalPrivacyUrl ?: null,
+            ]);
+            $this->api->patchOrg($newId, $patch); // non-fatal
+        }
 
         // Optionally send welcome email with SSO link.
         if (!empty($this->options['option3']['value'])) {
@@ -473,6 +507,324 @@ class paneldns extends HostingModule
             }
         }
         return empty($plans) ? false : $plans;
+    }
+
+    // ── Admin buttons ─────────────────────────────────────────────────────────
+
+    /**
+     * Re-mint a one-time SSO login URL and send the welcome email again.
+     * Shown as an admin button ("Resend Welcome Email") on the service page.
+     *
+     * @return bool true on success; calls $this->addError() on failure.
+     */
+    public function resendWelcome(): bool
+    {
+        if (!$this->api) {
+            $this->addError('PanelDNS: server connection not initialised.');
+            return false;
+        }
+
+        $id = $this->orgId();
+        if ($id <= 0) {
+            $this->addError('PanelDNS: service not provisioned — cannot send welcome email.');
+            return false;
+        }
+
+        $clientEmail = $this->client_data['email'] ?? '';
+        $sso = $this->api->mintOrgSsoToken($id, $clientEmail ?: null);
+
+        // SEC: validate returned URL scheme — prevents javascript:/data: injection.
+        if (
+            !$sso['ok']
+            || empty($sso['data']['login_url'])
+            || !str_starts_with((string) ($sso['data']['login_url'] ?? ''), 'https://')
+        ) {
+            $this->addError('PanelDNS: could not generate portal login link.');
+            return false;
+        }
+
+        $this->sendWelcomeEmail($id, $clientEmail);
+        $this->addInfo("PanelDNS: welcome email resent to {$clientEmail}.");
+        return true;
+    }
+
+    /**
+     * Fetch live org summary and surface key metrics as an info message.
+     * Shown as an admin button ("Resync Status") on the service page.
+     *
+     * @return bool true on success; calls $this->addError() on failure.
+     */
+    public function resyncStatus(): bool
+    {
+        if (!$this->api) {
+            $this->addError('PanelDNS: server connection not initialised.');
+            return false;
+        }
+
+        $id = $this->orgId();
+        if ($id <= 0) {
+            $this->addError('PanelDNS: no Org ID found — cannot resync.');
+            return false;
+        }
+
+        $resp = $this->api->orgSummary($id);
+        if (!$resp['ok']) {
+            $this->addError('PanelDNS: resync failed — see module activity log.');
+            return false;
+        }
+
+        $zones   = (int) ($resp['data']['usage']['active_zones'] ?? 0);
+        $clients = (int) ($resp['data']['usage']['sub_clients']  ?? 0);
+        $this->addInfo("PanelDNS: org #{$id} — {$zones} zones, {$clients} sub-clients.");
+        return true;
+    }
+
+    // ── SSO ───────────────────────────────────────────────────────────────────
+
+    /**
+     * Called by HostBill when the client clicks the SSO login link.
+     * Mints an SSO token, validates the returned URL, then redirects.
+     */
+    public function ssoLogin(): void
+    {
+        if (!$this->api) {
+            echo htmlspecialchars('PanelDNS: server connection not initialised.', ENT_QUOTES, 'UTF-8');
+            exit();
+        }
+
+        $id = $this->orgId();
+        if ($id <= 0) {
+            echo htmlspecialchars('PanelDNS: service not provisioned.', ENT_QUOTES, 'UTF-8');
+            exit();
+        }
+
+        $clientEmail = $this->client_data['email'] ?? '';
+        $resp = $this->api->mintOrgSsoToken($id, $clientEmail ?: null);
+
+        // SEC: validate scheme — prevents javascript:/data: redirect injection.
+        if (
+            !$resp['ok']
+            || empty($resp['data']['login_url'])
+            || !str_starts_with((string) ($resp['data']['login_url'] ?? ''), 'https://')
+        ) {
+            echo htmlspecialchars('PanelDNS: could not generate portal login link. Please try again or contact support.', ENT_QUOTES, 'UTF-8');
+            exit();
+        }
+
+        $loginUrl = (string) $resp['data']['login_url'];
+        header('Location: ' . $loginUrl, true, 302);
+        exit();
+    }
+
+    // ── Usage / detail ────────────────────────────────────────────────────────
+
+    /**
+     * Called by HostBill to populate usage graphs.
+     * Maps active_zones → disk and sub_clients → bandwidth.
+     *
+     * @return array{disk: int, bandwidth: int}
+     */
+    public function getUsage(): array
+    {
+        $empty = ['disk' => 0, 'bandwidth' => 0];
+
+        if (!$this->api) return $empty;
+
+        $id = $this->orgId();
+        if ($id <= 0) return $empty;
+
+        $resp = $this->api->orgSummary($id);
+        if (!$resp['ok']) return $empty;
+
+        return [
+            'disk'      => (int) ($resp['data']['usage']['active_zones'] ?? 0),
+            'bandwidth' => (int) ($resp['data']['usage']['sub_clients']  ?? 0),
+        ];
+    }
+
+    /**
+     * Called by HostBill to render extra info in the admin service view.
+     * Returns a self-contained HTML snippet; all values are escaped.
+     *
+     * @return string HTML string.
+     */
+    public function getServiceDetails(): string
+    {
+        $h = fn (mixed $v): string => htmlspecialchars((string) $v, ENT_QUOTES, 'UTF-8');
+
+        $id = $this->orgId();
+        if ($id <= 0) {
+            return '<em>Not provisioned.</em>';
+        }
+
+        if (!$this->api) {
+            return '<em>PanelDNS: server connection not initialised.</em>';
+        }
+
+        $resp = $this->api->orgSummary($id);
+        if (!$resp['ok']) {
+            return '<em>PanelDNS: could not load service details.</em>';
+        }
+
+        $data   = $resp['data'];
+        $org    = $data['org']   ?? [];
+        $usage  = $data['usage'] ?? [];
+        $plan   = $data['plan']  ?? [];
+
+        $status = $org['status'] ?? 'unknown';
+        $statusColor = match ($status) {
+            'active'    => '#0a7',
+            'suspended' => '#c80',
+            default     => '#888',
+        };
+
+        $zonesLimit   = isset($plan['zones'])   && $plan['zones']   !== null ? (int) $plan['zones']   : null;
+        $clientsLimit = isset($plan['clients']) && $plan['clients'] !== null ? (int) $plan['clients'] : null;
+
+        $zonesStr   = (int) ($usage['active_zones'] ?? 0) . ' / ' . ($zonesLimit   !== null ? $zonesLimit   : '∞');
+        $clientsStr = (int) ($usage['sub_clients']  ?? 0) . ' / ' . ($clientsLimit !== null ? $clientsLimit : '∞');
+
+        return '<table style="border-collapse:collapse;font-size:13px;width:100%;">'
+            . '<tr><th style="text-align:left;padding:3px 8px;">Org ID</th>'
+            .     '<td style="padding:3px 8px;">' . $h($id) . '</td></tr>'
+            . '<tr><th style="text-align:left;padding:3px 8px;">Status</th>'
+            .     '<td style="padding:3px 8px;color:' . $h($statusColor) . ';font-weight:600;text-transform:capitalize;">' . $h($status) . '</td></tr>'
+            . '<tr><th style="text-align:left;padding:3px 8px;">Plan</th>'
+            .     '<td style="padding:3px 8px;">' . ($plan ? $h($plan['name'] ?? '—') : '—') . '</td></tr>'
+            . '<tr><th style="text-align:left;padding:3px 8px;">Zones used / limit</th>'
+            .     '<td style="padding:3px 8px;">' . $h($zonesStr) . '</td></tr>'
+            . '<tr><th style="text-align:left;padding:3px 8px;">Sub-clients used / limit</th>'
+            .     '<td style="padding:3px 8px;">' . $h($clientsStr) . '</td></tr>'
+            . '<tr><th style="text-align:left;padding:3px 8px;">API calls this period</th>'
+            .     '<td style="padding:3px 8px;">' . $h((int) ($usage['api_calls_current_period'] ?? 0)) . '</td></tr>'
+            . '<tr><th style="text-align:left;padding:3px 8px;">Module version</th>'
+            .     '<td style="padding:3px 8px;">paneldns-hostbill v1.1.0</td></tr>'
+            . '</table>';
+    }
+
+    /**
+     * Called by HostBill to render HTML in the client portal service view.
+     * Returns a self-contained HTML block (no template files — HostBill embeds it).
+     * All server-supplied values are escaped.
+     *
+     * @return string HTML string.
+     */
+    public function clientArea(): string
+    {
+        $h = fn (mixed $v): string => htmlspecialchars((string) $v, ENT_QUOTES, 'UTF-8');
+
+        $id = $this->orgId();
+
+        // SSO button is always shown — even without usage data.
+        $ssoButton = '<a href="?action=sso" class="btn btn-primary">Login to PanelDNS</a>';
+
+        if ($id <= 0 || !$this->api) {
+            return $ssoButton;
+        }
+
+        $resp = $this->api->orgSummary($id);
+
+        if (!$resp['ok']) {
+            // Non-fatal: show just the button if summary is unavailable.
+            return $ssoButton;
+        }
+
+        $data   = $resp['data'];
+        $org    = $data['org']   ?? [];
+        $usage  = $data['usage'] ?? [];
+        $plan   = $data['plan']  ?? [];
+
+        $status = $org['status'] ?? 'unknown';
+
+        $zonesUsed   = (int) ($usage['active_zones'] ?? 0);
+        $clientsUsed = (int) ($usage['sub_clients']  ?? 0);
+        $zonesLimit  = isset($plan['zones'])   && $plan['zones']   !== null ? (int) $plan['zones']   : null;
+        $clLimit     = isset($plan['clients']) && $plan['clients'] !== null ? (int) $plan['clients'] : null;
+
+        $zonesStr   = $h($zonesUsed)   . ' / ' . ($zonesLimit !== null ? $h($zonesLimit)   : '∞') . ' zones';
+        $clientsStr = $h($clientsUsed) . ' / ' . ($clLimit    !== null ? $h($clLimit)      : '∞') . ' sub-clients';
+
+        $suspendedNote = '';
+        if ($status === 'suspended') {
+            $suspendedNote = '<div style="margin-top:10px;color:#c00;">'
+                . '<strong>Your account is currently suspended.</strong> '
+                . 'Please contact support to restore access.'
+                . '</div>';
+        }
+
+        return '<div>'
+            . $ssoButton
+            . '<div style="margin-top:12px;font-size:13px;">'
+            .     '<span style="margin-right:16px;">' . $zonesStr   . '</span>'
+            .     '<span>'                             . $clientsStr . '</span>'
+            . '</div>'
+            . $suspendedNote
+            . '</div>';
+    }
+
+    // ── Drift sync ────────────────────────────────────────────────────────────
+
+    /**
+     * Drift-sync check: compare the PanelDNS org status against the local
+     * HostBill service status and report mismatches.
+     *
+     * Designed to be called from HostBill's Task Scheduler or a custom cron
+     * script. Pass an array of maps via $this->options['drift_sync_map']:
+     *
+     *   [
+     *     ['org_id' => 123, 'status' => 'Active'],    // HostBill service status
+     *     ['org_id' => 456, 'status' => 'Suspended'],
+     *   ]
+     *
+     * Each entry is checked against PanelDNS live status. Mismatches are
+     * returned in the result array so the caller can trigger
+     * Suspend()/Unsuspend() as appropriate.
+     *
+     * Operators should wire this into HostBill's Task Scheduler
+     * (Settings → Task Scheduler → Add Task) to run nightly or hourly.
+     *
+     * @return array{checked: int, mismatched: list<array{org_id: int, hb_status: string, pdns_status: string}>}
+     */
+    public function driftSync(): array
+    {
+        $map = $this->options['drift_sync_map'] ?? [];
+        if (!is_array($map) || empty($map)) {
+            return ['checked' => 0, 'mismatched' => []];
+        }
+
+        $checked    = 0;
+        $mismatched = [];
+
+        foreach ($map as $entry) {
+            $orgId    = (int) ($entry['org_id'] ?? 0);
+            $hbStatus = strtolower(trim((string) ($entry['status'] ?? '')));
+            if ($orgId <= 0 || $hbStatus === '') continue;
+
+            if (!$this->api) continue;
+
+            $resp = $this->api->orgSummary($orgId);
+            if (!$resp['ok']) continue;
+
+            $checked++;
+            $pdnsStatus = strtolower((string) ($resp['data']['org']['status'] ?? ''));
+
+            // Mismatch: PanelDNS says suspended but HostBill considers the service Active.
+            // Mismatch: PanelDNS says active but HostBill considers the service Suspended.
+            $localActive    = $hbStatus === 'active';
+            $localSuspended = $hbStatus === 'suspended';
+            $pdnsSuspended  = $pdnsStatus === 'suspended';
+            $pdnsActive     = $pdnsStatus === 'active';
+
+            if (($localActive && $pdnsSuspended) || ($localSuspended && $pdnsActive)) {
+                $mismatched[] = [
+                    'org_id'      => $orgId,
+                    'hb_status'   => $hbStatus,
+                    'pdns_status' => $pdnsStatus,
+                ];
+            }
+        }
+
+        return ['checked' => $checked, 'mismatched' => $mismatched];
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
