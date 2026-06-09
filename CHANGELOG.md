@@ -1,5 +1,30 @@
 # Changelog
 
+## v2.2.0 — 2026-06-10
+
+### Added
+
+- **Per-account zone and record limit overrides** (CFG-01) — two new per-account detail
+  fields allow an individual service to have different quotas from the product default,
+  without changing the default for all other customers on the same product:
+
+  | Detail field | Name | Behaviour |
+  |---|---|---|
+  | `details.option3` | Zone Limit Override | When > 0, overrides `options.option1` (Zone Limit) for this service |
+  | `details.option4` | Max Records Per Zone Override | When > 0, overrides `options.option2` (Max Records Per Zone) for this service |
+
+  Both fields default to `0` (inherit product default). Set them in the HostBill admin
+  service detail view to give one customer a custom quota.
+
+  `Create()` and `ChangePackage()` now resolve limits via new `resolveZoneLimit()` and
+  `resolveMaxRecords()` helpers that apply the per-account → product-level precedence.
+
+  Mirrors the `$params['configoptions']['Zone Limit']` / `$params['configoptions']['Max
+  Records Per Zone']` override pattern in the WHMCS reseller module's `createAccount()`
+  and `changePackage()`.
+
+---
+
 ## v2.1.0 — 2026-06-09
 
 Parity fixes against `paneldns-reseller-whmcs` identified by gap analysis.

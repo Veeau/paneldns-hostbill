@@ -52,7 +52,7 @@ class paneldns extends HostingModule
     protected $description = 'PanelDNS — Sub-client DNS Hosting (Reseller)';
 
     /** Module version — bump in lockstep with the repo release tag. */
-    protected $version = '2.1.0';
+    protected $version = '2.2.0';
 
     /**
      * Server fields shown in Settings → Apps when configuring the server.
@@ -110,8 +110,15 @@ class paneldns extends HostingModule
 
     /**
      * Per-account details stored by HostBill against each individual service.
+     *
      * option1 — PanelDNS Sub-client ID (set after Create; used by all hooks).
      * option2 — Grace Period Deadline (YYYY-MM-DD; set by Terminate when grace > 0).
+     * option3 — Zone Limit Override (per-account; 0 = use product-level option1 default).
+     *           Mirrors $params['configoptions']['Zone Limit'] in the WHMCS module.
+     *           Set this on an individual service to give one customer a different quota
+     *           without changing the product default for everyone else.
+     * option4 — Max Records Per Zone Override (per-account; 0 = use product-level option2).
+     *           Mirrors $params['configoptions']['Max Records Per Zone'] in the WHMCS module.
      */
     protected $details = [
         'option1' => [
@@ -125,6 +132,18 @@ class paneldns extends HostingModule
             'value'   => '',
             'type'    => 'input',
             'default' => '',
+        ],
+        'option3' => [
+            'name'    => 'Zone Limit Override',
+            'value'   => '0',
+            'type'    => 'input',
+            'default' => '0',
+        ],
+        'option4' => [
+            'name'    => 'Max Records Per Zone Override',
+            'value'   => '0',
+            'type'    => 'input',
+            'default' => '0',
         ],
     ];
 
@@ -259,8 +278,10 @@ class paneldns extends HostingModule
             $clientName = $this->client_data['email'] ?? 'unknown';
         }
 
-        $zoneLimit  = (int) ($this->options['option1']['value'] ?? 5);
-        $maxRecords = (int) ($this->options['option2']['value'] ?? 100);
+        // CFG-01: per-account override takes precedence over product-level default.
+        // Mirrors $params['configoptions']['Zone Limit'] in the WHMCS module.
+        $zoneLimit  = $this->resolveZoneLimit();
+        $maxRecords = $this->resolveMaxRecords();
 
         // GDPR-LEGAL-01: stamp legal consent at provisioning time so the
         // sub-client account is covered from creation (actor_type=reseller_api).
@@ -420,8 +441,9 @@ class paneldns extends HostingModule
             $id = $this->subClientId();
             if ($id <= 0) { $this->addError('PanelDNS: no Sub-client ID — cannot change package.'); return false; }
 
-            $zoneLimit  = (int) ($this->options['option1']['value'] ?? 5);
-            $maxRecords = (int) ($this->options['option2']['value'] ?? 100);
+            // CFG-01: per-account override takes precedence over product-level default.
+            $zoneLimit  = $this->resolveZoneLimit();
+            $maxRecords = $this->resolveMaxRecords();
 
             $resp = $this->api->patchSubClient($id, [
                 'zone_limit'  => $zoneLimit,
@@ -1503,6 +1525,39 @@ class paneldns extends HostingModule
     private function serviceId(): int
     {
         return (int) ($this->account_details['id'] ?? 0);
+    }
+
+    /**
+     * CFG-01: resolve the effective zone limit for this service.
+     *
+     * Per-account details.option3 (Zone Limit Override) takes precedence over the
+     * product-level options.option1 (Zone Limit). A value of 0 in either field means
+     * "use the other level's value" — if both are 0 the sub-client inherits the
+     * reseller org's plan limit (PanelDNS enforces this server-side).
+     *
+     * Mirrors the $params['configoptions']['Zone Limit'] check in the WHMCS module's
+     * createAccount() and changePackage().
+     */
+    private function resolveZoneLimit(): int
+    {
+        $override = (int) ($this->details['option3']['value'] ?? 0);
+        if ($override > 0) return $override;
+        return (int) ($this->options['option1']['value'] ?? 5);
+    }
+
+    /**
+     * CFG-01: resolve the effective max-records-per-zone for this service.
+     *
+     * Per-account details.option4 (Max Records Per Zone Override) takes precedence
+     * over the product-level options.option2 (Max Records Per Zone).
+     *
+     * Mirrors $params['configoptions']['Max Records Per Zone'] in the WHMCS module.
+     */
+    private function resolveMaxRecords(): int
+    {
+        $override = (int) ($this->details['option4']['value'] ?? 0);
+        if ($override > 0) return $override;
+        return (int) ($this->options['option2']['value'] ?? 100);
     }
 
     /**
